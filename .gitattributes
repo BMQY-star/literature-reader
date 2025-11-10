@@ -1,0 +1,25 @@
+# 自动检测文本文件并执行行尾转换
+* text=auto
+
+# 明确声明你希望始终使用 LF 的文件
+*.sh text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# 声明始终使用 CRLF 的文件
+*.bat text eol=crlf
+
+# 二进制文件
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+
