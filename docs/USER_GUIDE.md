@@ -468,9 +468,10 @@ python server/main.py
 
 ## 📚 更多资源
 
-- **项目文档：** 查看 `README.md` 了解项目概述
+- **项目文档：** 查看 `../README.md` 了解项目概述
 - **API文档：** 查看 `API_CONFIG.md` 了解详细API配置
 - **贡献指南：** 查看 `CONTRIBUTING.md` 了解如何贡献代码
+- **故障排除：** 查看 `TROUBLESHOOTING.md` 了解常见问题解决方案
 
 ---
 

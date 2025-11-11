@@ -4,8 +4,10 @@ API路由模块：定义所有REST API端点
 import json
 import logging
 import os
+import time
 from pathlib import Path
-from flask import Blueprint, request, jsonify, send_from_directory, current_app
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from flask import Blueprint, request, jsonify, send_from_directory, current_app, Response, stream_with_context
 from werkzeug.utils import secure_filename
 from server.mineru_parser import parse_mineru_layout
 from server.mineru_api import (
@@ -18,7 +20,7 @@ from server.mineru_api import (
     parse_pdf_with_mineru_api,
     download_and_extract_zip
 )
-from server.translator_llm import translate_mineru_json
+from server.translator_llm import translate_mineru_json, translate_with_llm
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,205 @@ def get_standard_response(success: bool, message: str = "", data: dict = None):
         "data": data or {}
     }
     return jsonify(response)
+
+
+def chunk_markdown_text(text: str, max_chars: int = 1800) -> list:
+    if not text:
+        return []
+    
+    lines = text.splitlines()
+    chunks = []
+    current = []
+    current_len = 0
+    fence_open = False
+    
+    for line in lines:
+        stripped = line.rstrip('\n')
+        if stripped.lstrip().startswith('#') and not fence_open and current:
+            # 新的标题开始，先提交当前块
+            chunks.append('\n'.join(current).strip('\n'))
+            current = [line]
+            current_len = len(line)
+            continue
+        
+        current.append(line)
+        current_len += len(line)
+        
+        fence_count = stripped.count('```')
+        if fence_count % 2 == 1:
+            fence_open = not fence_open
+        
+        # 如果没有标题分隔，仍然按长度拆分
+        if not fence_open and current_len >= max_chars:
+            chunks.append('\n'.join(current).strip('\n'))
+            current = []
+            current_len = 0
+    
+    if current:
+        chunks.append('\n'.join(current).strip('\n'))
+    
+    filtered = [chunk for chunk in chunks if chunk.strip()]
+    return filtered or [text.strip()]
+
+
+def format_sse(event: str, data: dict) -> str:
+    """
+    构建符合SSE协议的消息字符串
+    """
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def translate_full_markdown(task_id: str, target_lang: str = 'zh', model: str = None, translation_id: str = None, timestamp: int = None) -> tuple:
+    mineru_folder = Path(current_app.config['MINERU_FOLDER'])
+    full_path = mineru_folder / task_id / 'full.md'
+    if not full_path.exists():
+        raise FileNotFoundError("未找到full.md")
+    
+    raw_text = full_path.read_text(encoding='utf-8')
+    chunks = chunk_markdown_text(raw_text)
+    translated_chunks = []
+    
+    for chunk in chunks:
+        if not chunk.strip():
+            translated_chunks.append(chunk)
+        else:
+            translated_chunks.append(
+                translate_with_llm(chunk, target_lang=target_lang, model=model)
+            )
+    
+    translated_text = '\n\n'.join(translated_chunks)
+    
+    if timestamp is None:
+        timestamp = int(time.time())
+    if translation_id is None:
+        translation_id = f"trans_{timestamp}"
+    
+    output_path = full_path.parent / f'full_translated_{target_lang}.md'
+    output_path.write_text(translated_text, encoding='utf-8')
+    
+    translations_folder = mineru_folder / 'translations'
+    translations_folder.mkdir(parents=True, exist_ok=True)
+    archive_file = translations_folder / f"full_{translation_id}_{target_lang}_{timestamp}.md"
+    archive_file.write_text(translated_text, encoding='utf-8')
+    
+    return translated_text, archive_file.name, len(chunks)
+
+
+def translate_full_markdown_stream(task_id: str, target_lang: str = 'zh', model: str = None,
+                                   translation_id: str = None, timestamp: int = None):
+    """
+    将full.md按块翻译，并通过SSE实时推送进度（多并发版本）
+    """
+    mineru_folder = Path(current_app.config['MINERU_FOLDER'])
+    full_path = mineru_folder / task_id / 'full.md'
+    if not full_path.exists():
+        raise FileNotFoundError("未找到full.md")
+    
+    raw_text = full_path.read_text(encoding='utf-8')
+    chunks = chunk_markdown_text(raw_text)
+    total_chunks = len(chunks)
+    
+    if timestamp is None:
+        timestamp = int(time.time())
+    if translation_id is None:
+        translation_id = f"trans_{timestamp}"
+    
+    translations_folder = mineru_folder / 'translations'
+    translations_folder.mkdir(parents=True, exist_ok=True)
+    
+    output_path = full_path.parent / f'full_translated_{target_lang}.md'
+    archive_file = translations_folder / f"full_{translation_id}_{target_lang}_{timestamp}.md"
+    
+    # 并发数量：根据块数量动态调整，最多10个并发
+    max_workers = min(10, max(3, total_chunks // 3))
+    
+    # 获取应用实例和配置，用于在线程中创建上下文
+    app = current_app._get_current_object()
+    
+    def translate_chunk(idx, chunk):
+        """翻译单个块的辅助函数（在线程中运行，需要应用上下文）"""
+        chunk_number = idx + 1
+        if not chunk.strip():
+            return idx, chunk, "success", ""
+        
+        # 在线程中创建 Flask 应用上下文
+        with app.app_context():
+            try:
+                logger.info(f"调用LLM翻译Markdown块 [{chunk_number}/{total_chunks}]，长度={len(chunk)}")
+                translated_chunk = translate_with_llm(chunk, target_lang=target_lang, model=model)
+                return idx, translated_chunk, "success", ""
+            except Exception as chunk_error:
+                error_message = str(chunk_error)
+                logger.error(f"翻译Markdown块失败 [{chunk_number}/{total_chunks}]: {chunk_error}")
+                return idx, chunk, "failed", error_message
+    
+    def event_stream():
+        translated_chunks = [None] * total_chunks  # 预分配列表，保持顺序
+        completed_count = 0
+        
+        try:
+            init_payload = {
+                "task_id": task_id,
+                "total_chunks": total_chunks,
+                "target_lang": target_lang,
+                "translation_id": translation_id,
+                "timestamp": timestamp,
+                "max_workers": max_workers
+            }
+            yield format_sse("init", init_payload)
+            
+            # 使用线程池并发翻译
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有翻译任务
+                future_to_idx = {
+                    executor.submit(translate_chunk, idx, chunk): idx 
+                    for idx, chunk in enumerate(chunks)
+                }
+                
+                # 按完成顺序处理结果（不一定是提交顺序）
+                for future in as_completed(future_to_idx):
+                    idx, translated_chunk, status, error_message = future.result()
+                    translated_chunks[idx] = translated_chunk
+                    completed_count += 1
+                    
+                    # 实时推送进度
+                    progress_payload = {
+                        "task_id": task_id,
+                        "chunk_index": idx,
+                        "chunk_number": idx + 1,
+                        "total_chunks": total_chunks,
+                        "completed_count": completed_count,
+                        "status": status,
+                        "translated_chunk": translated_chunk,
+                        "error": error_message
+                    }
+                    yield format_sse("progress", progress_payload)
+            
+            # 确保所有块都已翻译（处理可能的异常情况）
+            for idx, chunk_result in enumerate(translated_chunks):
+                if chunk_result is None:
+                    translated_chunks[idx] = chunks[idx]  # 失败时使用原文
+                    logger.warning(f"块 {idx + 1} 翻译结果为空，使用原文")
+            
+            # 按顺序拼接所有翻译结果
+            translated_text = '\n\n'.join(translated_chunks)
+            output_path.write_text(translated_text, encoding='utf-8')
+            archive_file.write_text(translated_text, encoding='utf-8')
+            
+            complete_payload = {
+                "task_id": task_id,
+                "total_chunks": total_chunks,
+                "translation_file": archive_file.name,
+                "content": translated_text
+            }
+            yield format_sse("complete", complete_payload)
+        
+        except Exception as e:
+            logger.error(f"SSE翻译流程异常: {e}", exc_info=True)
+            yield format_sse("error", {"message": str(e)})
+    
+    return event_stream()
 
 
 @api_bp.route('/health', methods=['GET'])
@@ -279,6 +480,7 @@ def parse_mineru_layout_from_data(mineru_data: dict) -> list:
                 logger.debug(f"第{page_no}页有 {len(para_blocks)} 个段落块")
                 
                 # 遍历段落块
+                block_counter = 0
                 for block in para_blocks:
                     block_type = block.get("type", "")
                     
@@ -310,11 +512,19 @@ def parse_mineru_layout_from_data(mineru_data: dict) -> list:
                     text = " ".join(text_parts).strip()
                     
                     if text:  # 只添加非空文本块
+                        block_id = (
+                            block.get("block_id")
+                            or block.get("id")
+                            or block.get("uuid")
+                            or f"p{page_no}_b{block_counter}"
+                        )
+                        block_counter += 1
                         layout.append({
                             "page": page_no,
                             "bbox": bbox,
                             "text": text,
-                            "type": block_type
+                            "type": block_type,
+                            "block_id": block_id
                         })
                         logger.debug(f"添加{block_type}块: 第{page_no}页, 文本长度: {len(text)}")
             
@@ -328,6 +538,7 @@ def parse_mineru_layout_from_data(mineru_data: dict) -> list:
                 logger.info("检测到content_list.json格式")
                 logger.info(f"开始解析，共 {len(mineru_data)} 个文本块")
                 
+                block_counter = 0
                 for item in mineru_data:
                     text = item.get("text", "").strip()
                     if not text:
@@ -344,11 +555,20 @@ def parse_mineru_layout_from_data(mineru_data: dict) -> list:
                     if item.get("text_level") == 1:
                         block_type = "title"
                     
+                    block_id = (
+                        item.get("block_id")
+                        or item.get("id")
+                        or item.get("uuid")
+                        or f"p{page_no}_b{block_counter}"
+                    )
+                    block_counter += 1
+
                     layout.append({
                         "page": page_no,
                         "bbox": bbox,
                         "text": text,
-                        "type": block_type
+                        "type": block_type,
+                        "block_id": block_id
                     })
                 
                 logger.info(f"解析完成，共提取 {len(layout)} 个文本块")
@@ -360,6 +580,7 @@ def parse_mineru_layout_from_data(mineru_data: dict) -> list:
                 logger.info(f"开始解析，共 {len(mineru_data)} 页")
                 
                 for page_idx, page_blocks in enumerate(mineru_data):
+                    block_counter = 0
                     page_no = page_idx + 1
                     
                     if not isinstance(page_blocks, list):
@@ -382,11 +603,20 @@ def parse_mineru_layout_from_data(mineru_data: dict) -> list:
                         # 前端可能需要根据实际页面尺寸进行转换
                         block_type = block.get("type", "text")
                         
+                        block_id = (
+                            block.get("block_id")
+                            or block.get("id")
+                            or block.get("uuid")
+                            or f"p{page_no}_b{block_counter}"
+                        )
+                        block_counter += 1
+
                         layout.append({
                             "page": page_no,
                             "bbox": bbox,
                             "text": content,
-                            "type": block_type
+                            "type": block_type,
+                            "block_id": block_id
                         })
                 
                 logger.info(f"解析完成，共提取 {len(layout)} 个文本块")
@@ -410,6 +640,7 @@ def parse_mineru_layout_from_data(mineru_data: dict) -> list:
                 logger.debug(f"第{page_no}页有 {len(blocks)} 个块")
                 
                 # 遍历页面中的所有块
+                block_counter = 0
                 for block_idx, block in enumerate(blocks):
                     block_type = block.get("type", "")
                     
@@ -431,11 +662,19 @@ def parse_mineru_layout_from_data(mineru_data: dict) -> list:
                         
                         if text:  # 只添加非空文本块
                             bbox = block.get("bbox") or block.get("bbox_coords") or [0, 0, 0, 0]
+                            block_id = (
+                                block.get("block_id")
+                                or block.get("id")
+                                or block.get("uuid")
+                                or f"p{page_no}_b{block_counter}"
+                            )
+                            block_counter += 1
                             layout.append({
                                 "page": page_no,
                                 "bbox": bbox,
                                 "text": text,
-                                "type": block_type
+                                "type": block_type,
+                                "block_id": block_id
                             })
                             logger.debug(f"添加文本块: 第{page_no}页, 文本长度: {len(text)}")
             
@@ -665,8 +904,6 @@ def translate_layout():
         model = data.get('model')
         force_retranslate = data.get('force_retranslate', False)  # 是否强制重新翻译
         
-        from server.translator_llm import translate_with_llm
-        
         # 检查是否配置了通义千问
         qwen_api_key = current_app.config.get('QWEN_API_KEY', '')
         if qwen_api_key:
@@ -682,50 +919,50 @@ def translate_layout():
         
         logger.info(f"开始翻译 {total_count} 个文本块，目标语言: {target_lang}, 强制重新翻译: {force_retranslate}")
         
-        # 翻译每个文本块
+        # 翻译每个文本块 - 保持原始顺序
+        # 重要：必须保持layout的顺序，以便前端能正确匹配
+        translated_layout = []
         for idx, block in enumerate(layout):
             text = block.get('text', '').strip()
+            
+            # 如果文本为空，直接添加到结果中（保持顺序）
             if not text:
+                translated_layout.append({ **block })
                 continue
             
-            # 如果已有翻译且不强制重新翻译，则跳过
+            # 如果已有翻译且不强制重新翻译，则跳过（但也要添加到结果中）
             if not force_retranslate and block.get('translated_text'):
+                translated_layout.append({ **block })
                 skipped_count += 1
                 continue
             
             try:
-                import time
                 block_start_time = time.time()
-                logger.info(f"=" * 60)
-                logger.info(f"开始翻译文本块 [{idx+1}/{total_count}]")
-                logger.info(f"文本内容预览: {text[:100]}...")
-                logger.info(f"文本块长度: {len(text)} 字符，目标语言: {target_lang}")
-                logger.info(f"开始时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # 减少日志输出，只在关键节点记录（提升性能）
+                if (idx + 1) % 10 == 0 or idx == 0:
+                    logger.info(f"翻译进度: [{idx+1}/{total_count}] ({translated_count*100//total_count}%)")
                 
                 # 调用大模型进行翻译
-                logger.info(f"准备调用 translate_with_llm 函数...")
                 translated_text = translate_with_llm(text, target_lang=target_lang, model=model)
                 block_elapsed = time.time() - block_start_time
-                logger.info(f"文本块 [{idx+1}] 翻译完成，耗时: {block_elapsed:.2f}秒")
+                
+                # 只在慢请求时记录详细日志（>2秒）
+                if block_elapsed > 2.0:
+                    logger.warning(f"慢请求: 文本块 [{idx+1}] 耗时 {block_elapsed:.2f}秒, 长度={len(text)}")
                 
                 # 检查翻译结果是否与原文相同（可能是错误）
                 if translated_text == text and len(text) > 10:
-                    logger.warning(f"⚠️ 翻译结果与原文相同，可能大模型未进行翻译: {text[:100]}...")
-                else:
-                    logger.info(f"✅ 文本块 [{idx+1}] 翻译成功")
+                    logger.warning(f"⚠️ 翻译结果与原文相同: {text[:50]}...")
                 
-                block['translated_text'] = translated_text
+                # 保持原始block结构，只添加translated_text
+                translated_block = { **block, 'translated_text': translated_text }
+                translated_layout.append(translated_block)
                 translated_count += 1
-                
-                # 每翻译1个文本块就记录一次进度（确保能看到进度）
-                logger.info(f"📊 当前进度: {translated_count}/{total_count} ({translated_count*100//total_count}%)")
-                
-                # 每翻译10个文本块记录一次详细进度
                 if translated_count % 10 == 0:
                     logger.info(f"🎯 里程碑进度: {translated_count}/{total_count} ({translated_count*100//total_count}%)")
                     
             except Exception as e:
-                import time
                 error_msg = str(e)
                 logger.error(f"❌ 翻译文本块失败 [{idx+1}/{total_count}]")
                 logger.error(f"错误信息: {error_msg}")
@@ -740,11 +977,23 @@ def translate_layout():
                     logger.error(f"完整错误堆栈:\n{traceback.format_exc()}")
                     logger.error(f"失败时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
-                # 失败时保留原文或已有翻译
-                if not block.get('translated_text'):
-                    block['translated_text'] = text
+                # 失败时保留原文或已有翻译，但仍要添加到结果中
+                failed_block = { **block }
+                if not failed_block.get('translated_text'):
+                    failed_block['translated_text'] = text
+                translated_layout.append(failed_block)
+        
+        # 确保所有块都被添加到translated_layout中（保持顺序）
+        # 如果有些块没有被处理（比如空文本或跳过），确保它们也在结果中
+        if len(translated_layout) < len(layout):
+            logger.warning(f"translated_layout长度({len(translated_layout)})小于原始layout长度({len(layout)})，检查是否有遗漏的块")
+            # 补充遗漏的块
+            for idx, block in enumerate(layout):
+                if idx >= len(translated_layout):
+                    translated_layout.append({ **block })
         
         logger.info(f"翻译完成: 成功 {translated_count} 个，跳过 {skipped_count} 个，失败 {failed_count} 个，总计 {total_count} 个文本块")
+        logger.info(f"返回的layout长度: {len(translated_layout)}，原始layout长度: {len(layout)}")
         
         # 如果有失败，提供更详细的错误信息
         message = f"翻译完成：成功 {translated_count} 个"
@@ -772,13 +1021,111 @@ def translate_layout():
                 else:
                     message += f"（错误: {first_error[:100]}...）"
         
+        # 保存翻译结果到JSON文件（如果提供了translation_id）
+        translation_id = data.get('translation_id')
+        translation_file = None
+        
+        if translation_id:
+            import time
+            # 使用translation_id和timestamp生成固定文件名，每次合并保存（因为可能是逐个翻译）
+            # 这样所有翻译结果都会保存在同一个文件中
+            timestamp = data.get('timestamp')  # 如果前端提供了timestamp，使用它；否则使用当前时间
+            if not timestamp:
+                timestamp = int(time.time())
+            
+            # 创建翻译结果目录
+            translations_folder = Path(current_app.config['MINERU_FOLDER']) / 'translations'
+            translations_folder.mkdir(parents=True, exist_ok=True)
+            
+            # 使用固定的文件名（基于translation_id和timestamp）
+            translation_file = translations_folder / f"translation_{translation_id}_{timestamp}.json"
+            
+            # 尝试读取已有的翻译结果（如果存在）
+            existing_data = None
+            if translation_file.exists():
+                try:
+                    with open(translation_file, 'r', encoding='utf-8') as f:
+                        existing_data = json.load(f)
+                except Exception as read_error:
+                    logger.warning(f"读取已有翻译结果失败: {read_error}")
+            
+            # 合并翻译结果
+            if existing_data and isinstance(existing_data.get('layout'), list):
+                # 合并layout：优先按block_id匹配，其次回退到text+page
+                existing_layout = existing_data.get('layout', [])
+                
+                def get_block_key(block):
+                    block_id = block.get('block_id')
+                    if block_id:
+                        return f"id_{block_id}"
+                    block_text = (block.get('text') or '').strip()
+                    block_page = block.get('page') or block.get('page_no') or block.get('pageNo') or 1
+                    return f"text_{block_page}_{block_text}"
+                
+                existing_layout_map = {get_block_key(block): block for block in existing_layout}
+                
+                # 更新或添加新的翻译块
+                for new_block in translated_layout:
+                    key = get_block_key(new_block)
+                    existing_layout_map[key] = new_block
+                
+                # 合并后的layout保持原有顺序，尽量使用existing_layout顺序，追加新块
+                merged_layout = []
+                seen_keys = set()
+                for block in existing_layout:
+                    key = get_block_key(block)
+                    if key in existing_layout_map:
+                        merged_layout.append(existing_layout_map[key])
+                        seen_keys.add(key)
+                # 添加新增块
+                for key, block in existing_layout_map.items():
+                    if key not in seen_keys:
+                        merged_layout.append(block)
+                
+                # 重新计算统计数据
+                translated_count = sum(1 for blk in merged_layout if blk.get('translated_text') and blk.get('translated_text') != blk.get('text'))
+                skipped_count = sum(1 for blk in merged_layout if blk.get('translated_text') and blk.get('translated_text') == blk.get('text'))
+                failed_count = sum(1 for blk in merged_layout if not blk.get('translated_text'))
+                total_count = len(merged_layout)
+            else:
+                # 如果没有已有数据，直接使用当前结果
+                merged_layout = translated_layout
+                total_count = len(merged_layout)
+                translated_count = sum(1 for blk in merged_layout if blk.get('translated_text') and blk.get('translated_text') != blk.get('text'))
+                skipped_count = sum(1 for blk in merged_layout if blk.get('translated_text') and blk.get('translated_text') == blk.get('text'))
+                failed_count = sum(1 for blk in merged_layout if not blk.get('translated_text'))
+            
+            translation_data = {
+                "translation_id": translation_id,
+                "timestamp": timestamp,
+                "target_lang": target_lang,
+                "model": model,
+                "translated_count": translated_count,
+                "skipped_count": skipped_count,
+                "failed_count": failed_count,
+                "total_count": total_count,
+                "layout": merged_layout
+            }
+            
+            try:
+                with open(translation_file, 'w', encoding='utf-8') as f:
+                    json.dump(translation_data, f, ensure_ascii=False, indent=2)
+                logger.debug(f"翻译结果已保存到: {translation_file} (共 {len(merged_layout)} 个块)")
+            except Exception as save_error:
+                logger.warning(f"保存翻译结果失败: {save_error}")
+        
         response_data = {
-            "layout": layout,
+            "layout": translated_layout,  # 使用保持顺序的translated_layout
             "translated_count": translated_count,
             "skipped_count": skipped_count,
             "failed_count": failed_count,
             "total_count": total_count
         }
+        
+        if translation_id:
+            response_data["translation_id"] = translation_id
+        if translation_file:
+            response_data["translation_file"] = str(translation_file.name)  # 只返回文件名，不包含路径
         
         # 如果有错误，添加错误详情
         if first_error:
@@ -812,6 +1159,85 @@ def translate_layout():
         return get_standard_response(False, friendly_msg, {
             "error_detail": error_msg
         }), 500
+
+
+@api_bp.route('/translate-full', methods=['POST'])
+def translate_full_text():
+    """
+    翻译MinerU生成的全文Markdown（full.md）- 同步版本（已废弃，建议使用流式版本）
+    """
+    try:
+        data = request.get_json() or {}
+        task_id = data.get('task_id')
+        if not task_id:
+            return get_standard_response(False, "task_id不能为空", {}), 400
+        
+        target_lang = data.get('target_lang', current_app.config.get('DEFAULT_TARGET_LANG', 'zh'))
+        model = data.get('model')
+        translation_id = data.get('translation_id')
+        timestamp = data.get('timestamp')
+        
+        translated_text, filename, chunk_count = translate_full_markdown(
+            task_id,
+            target_lang=target_lang,
+            model=model,
+            translation_id=translation_id,
+            timestamp=timestamp
+        )
+        
+        return get_standard_response(True, "全文翻译完成", {
+            "task_id": task_id,
+            "target_lang": target_lang,
+            "content": translated_text,
+            "translation_file": filename,
+            "chunk_count": chunk_count
+        })
+    except FileNotFoundError:
+        return get_standard_response(False, "未找到full.md文件", {}), 404
+    except Exception as e:
+        logger.error(f"全文翻译失败: {e}", exc_info=True)
+        return get_standard_response(False, f"翻译失败: {str(e)}", {}), 500
+
+
+@api_bp.route('/translate-full-stream', methods=['POST'])
+def translate_full_text_stream():
+    """
+    翻译MinerU生成的全文Markdown（full.md）- 流式版本（SSE）
+    实时推送翻译进度，支持边翻译边显示
+    """
+    try:
+        data = request.get_json() or {}
+        task_id = data.get('task_id')
+        if not task_id:
+            return get_standard_response(False, "task_id不能为空", {}), 400
+        
+        target_lang = data.get('target_lang', current_app.config.get('DEFAULT_TARGET_LANG', 'zh'))
+        model = data.get('model')
+        translation_id = data.get('translation_id')
+        timestamp = data.get('timestamp')
+        
+        from flask import Response
+        return Response(
+            stream_with_context(
+                translate_full_markdown_stream(
+                    task_id,
+                    target_lang=target_lang,
+                    model=model,
+                    translation_id=translation_id,
+                    timestamp=timestamp
+                )
+            ),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no'  # 禁用Nginx缓冲
+            }
+        )
+    except FileNotFoundError:
+        return get_standard_response(False, "未找到full.md文件", {}), 404
+    except Exception as e:
+        logger.error(f"流式翻译失败: {e}", exc_info=True)
+        return get_standard_response(False, f"翻译失败: {str(e)}", {}), 500
 
 
 @api_bp.route('/translate', methods=['POST'])
@@ -1003,4 +1429,34 @@ def get_image(task_id: str, image_name: str):
     except Exception as e:
         logger.error(f"获取图片失败: {e}", exc_info=True)
         return get_standard_response(False, f"图片不存在: {image_name}", {}), 404
+
+
+@api_bp.route('/download-translation/<filename>', methods=['GET'])
+def download_translation(filename: str):
+    """
+    下载翻译结果JSON文件
+    
+    Args:
+        filename: 翻译结果文件名（如 translation_xxx_1234567890.json）
+    """
+    try:
+        translations_folder = Path(current_app.config['MINERU_FOLDER']) / 'translations'
+        file_path = translations_folder / secure_filename(filename)
+        
+        # 安全检查：确保文件在translations文件夹内
+        if not str(file_path.resolve()).startswith(str(translations_folder.resolve())):
+            return get_standard_response(False, "非法路径", {}), 403
+        
+        if not file_path.exists():
+            return get_standard_response(False, f"文件不存在: {filename}", {}), 404
+        
+        return send_from_directory(
+            str(file_path.parent), 
+            file_path.name,
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        logger.error(f"下载翻译结果失败: {e}", exc_info=True)
+        return get_standard_response(False, f"下载失败: {str(e)}", {}), 500
 

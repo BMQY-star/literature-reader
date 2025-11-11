@@ -31,6 +31,10 @@ export default function FullTextView({ content, taskId }) {
       )
     }
 
+    // 为行内数学公式增加非断行空格，避免中英文紧贴导致渲染问题
+    processed = processed.replace(/([^\s])\$(?!\s)([^$\n]+?)\$/g, '$1 $' + '$2$')
+    processed = processed.replace(/\$([^$\n]+?)\$(?!\s)([^\s])/g, '$$$1$ ' + '$2')
+
     setProcessedContent(processed)
   }, [content, taskId])
 
@@ -59,7 +63,7 @@ export default function FullTextView({ content, taskId }) {
 
   return (
     <div className="prose prose-sm max-w-none p-6">
-      <div 
+      <article
         ref={contentRef}
         className="markdown-content"
         dangerouslySetInnerHTML={{ __html: markdownToHtml(processedContent) }}
@@ -215,10 +219,10 @@ function markdownToHtml(markdown) {
   html = html.replace(/^## (.*$)/gim, '<h2 class="text-2xl font-bold mt-8 mb-4">$1</h2>')
   html = html.replace(/^# (.*$)/gim, '<h1 class="text-3xl font-bold mt-8 mb-4">$1</h1>')
   
-  // 粗体和斜体
+  // 粗体和斜体（保留 Markdown 语法，避免破坏公式）
   html = html.replace(/\*\*\*(.*?)\*\*\*/g, '<strong><em>$1</em></strong>')
   html = html.replace(/\*\*(.*?)\*\*/g, '<strong class="font-bold">$1</strong>')
-  html = html.replace(/\*(.*?)\*/g, '<em class="italic">$1</em>')
+  html = html.replace(/(?<!\\)\*(.+?)(?<!\\)\*/g, '<em class="italic">$1</em>')
   
   // 链接
   html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">$1</a>')

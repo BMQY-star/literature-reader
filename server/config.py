@@ -20,9 +20,9 @@ class Config:
     LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
     
     # LLM配置 - 通义千问
-    QWEN_API_KEY = os.environ.get('QWEN_API_KEY', '')
+    QWEN_API_KEY = os.environ.get('QWEN_API_KEY', 'sk-2b962ab7987c411ca3f05c12a1d35805')
     QWEN_BASE_URL = os.environ.get('QWEN_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
-    QWEN_MODEL = os.environ.get('QWEN_MODEL', 'qwen-turbo')
+    QWEN_MODEL = os.environ.get('QWEN_MODEL', 'qwen-plus')
     
     # 兼容OpenAI格式的配置（用于通义千问）
     OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')  # 如果使用通义千问，这里填QWEN_API_KEY
@@ -30,7 +30,7 @@ class Config:
     DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', QWEN_MODEL)
     
     # MinerU API配置
-    MINERU_TOKEN = os.environ.get('MINERU_TOKEN', '')  # MinerU API Token
+    MINERU_TOKEN = os.environ.get('MINERU_TOKEN', 'eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiIzODcwNDY0MyIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc2MjQxMTAyMywiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiMTUxMTMxNzIwNjkiLCJvcGVuSWQiOm51bGwsInV1aWQiOiJkMDg2ZTE0YS1iZWM2LTQ3NmEtYjUwYi01YjI3N2ZlYWY4YTkiLCJlbWFpbCI6IiIsImV4cCI6MTc2MzYyMDYyM30._fq74Us1fFeaXJ4nFmeApp4u5O_-yZpckoe6s3Bo5790jCkpj_aTODF-4-Qb7cOZblJAPeGSG80fDMF7tMyI2w')  # MinerU API Token
     MINERU_BASE_URL = os.environ.get('MINERU_BASE_URL', 'https://mineru.net/api/v4')
     MINERU_TIMEOUT = int(os.environ.get('MINERU_TIMEOUT', '300'))  # 5分钟超时
     MINERU_MODEL_VERSION = os.environ.get('MINERU_MODEL_VERSION', 'vlm')  # pipeline 或 vlm

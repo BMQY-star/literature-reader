@@ -67,6 +67,20 @@ export default function BilingualView({ layout = [], originalContent = null, tra
     }
   }, [originalContent, translatedContent, layout])
 
+  // 检查layout中是否有翻译
+  const hasTranslatedBlocks = layout.some(block => block.translated_text && block.translated_text.trim().length > 0)
+  
+  // 调试：打印翻译状态
+  useEffect(() => {
+    if (layout.length > 0) {
+      const translatedCount = layout.filter(block => block.translated_text && block.translated_text.trim().length > 0).length
+      console.log(`[BilingualView] Layout状态: 总数=${layout.length}, 已翻译=${translatedCount}, 有全文翻译=${!!translatedContent}`)
+      if (translatedCount > 0 && !translatedContent) {
+        console.log('[BilingualView] 检测到layout中有翻译，但translatedFullText为空，将使用layout模式显示')
+      }
+    }
+  }, [layout, translatedContent])
+  
   // 如果有全文内容且翻译内容不为空，使用全文内容；否则使用layout数据
   if (originalContent && translatedContent && translatedContent.trim().length > 0) {
     return (
@@ -107,6 +121,11 @@ export default function BilingualView({ layout = [], originalContent = null, tra
       </div>
     )
   }
+  
+  // 如果没有全文翻译但有layout翻译，显示提示
+  if (originalContent && !translatedContent && hasTranslatedBlocks) {
+    console.log('检测到layout中有翻译，但translatedFullText为空，使用layout模式显示')
+  }
 
   // 使用layout数据构建对照视图
   if (layout.length === 0) {
@@ -117,8 +136,23 @@ export default function BilingualView({ layout = [], originalContent = null, tra
       </div>
     )
   }
+  
+  // 检查是否有翻译
+  if (!hasTranslatedBlocks) {
+    return (
+      <div className="p-8 text-center text-gray-500">
+        <p>暂无翻译内容</p>
+        <p className="text-sm mt-2">请先点击"翻译全文"按钮进行翻译</p>
+      </div>
+    )
+  }
 
   // 按页面分组
+  const getBlockKey = (block, fallback) => {
+    if (!block) return fallback
+    return block.block_id || block.id || fallback
+  }
+
   const blocksByPage = {}
   layout.forEach(block => {
     const page = block.page || block.page_no || block.pageNo || 1
@@ -145,16 +179,18 @@ export default function BilingualView({ layout = [], originalContent = null, tra
           {pages.map(page => (
             <div key={`original-page-${page}`} className="mb-8">
               <div className="text-xs font-semibold text-gray-500 mb-3">第 {page} 页</div>
-              {blocksByPage[page].map((block, idx) => (
+              {blocksByPage[page].map((block, idx) => {
+                const key = `original-${page}-${getBlockKey(block, idx)}`
+                return (
                 <div 
-                  key={`original-${page}-${idx}`}
+                  key={key}
                   className="mb-4 p-3 bg-gray-50 rounded border border-gray-200"
                 >
                   <p className="text-sm leading-relaxed text-gray-800 whitespace-pre-wrap">
                     {block.text || ''}
                   </p>
                 </div>
-              ))}
+              )})}
             </div>
           ))}
         </div>
@@ -173,16 +209,34 @@ export default function BilingualView({ layout = [], originalContent = null, tra
           {pages.map(page => (
             <div key={`translated-page-${page}`} className="mb-8">
               <div className="text-xs font-semibold text-gray-500 mb-3">第 {page} 页</div>
-              {blocksByPage[page].map((block, idx) => (
-                <div 
-                  key={`translated-${page}-${idx}`}
-                  className="mb-4 p-3 bg-white rounded border border-gray-200"
-                >
-                  <p className="text-sm leading-relaxed text-gray-800 whitespace-pre-wrap">
-                    {block.translated_text || block.text || ''}
-                  </p>
-                </div>
-              ))}
+              {blocksByPage[page].map((block, idx) => {
+                const key = `translated-${page}-${getBlockKey(block, idx)}`
+                // 优先显示翻译，如果没有翻译则显示原文（但添加提示）
+                const displayText = block.translated_text && block.translated_text.trim()
+                  ? block.translated_text.trim()
+                  : (block.text || '')
+                const hasTranslation = block.translated_text && block.translated_text.trim()
+                
+                return (
+                  <div 
+                    key={key}
+                    className={`mb-4 p-3 rounded border ${
+                      hasTranslation 
+                        ? 'bg-white border-gray-200' 
+                        : 'bg-yellow-50 border-yellow-200'
+                    }`}
+                  >
+                    {!hasTranslation && (
+                      <div className="text-xs text-yellow-600 mb-1 italic">
+                        ⚠️ 此文本块尚未翻译
+                      </div>
+                    )}
+                    <p className="text-sm leading-relaxed text-gray-800 whitespace-pre-wrap">
+                      {displayText}
+                    </p>
+                  </div>
+                )
+              })}
             </div>
           ))}
         </div>

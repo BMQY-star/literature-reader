@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import PdfViewer from './components/PdfViewer'
 import LayoutOverlay from './components/LayoutOverlay'
 import BlockText from './components/BlockText'
-import { uploadFile, parsePdfWithApi, getTaskStatus, getBatchStatus, translateLayout, getFileUrl, getFullText } from './api'
+import { uploadFile, parsePdfWithApi, getTaskStatus, getBatchStatus, translateFullMarkdownStream, getFileUrl, getFullText, getTranslationDownloadUrl } from './api'
 import FullTextView from './components/FullTextView'
 import BilingualView from './components/BilingualView'
 
@@ -27,6 +27,7 @@ function App() {
   const [fullTextLoading, setFullTextLoading] = useState(false) // 全文加载状态
   const [translatedFullText, setTranslatedFullText] = useState(null) // 翻译后的全文内容
   const [isFullscreen, setIsFullscreen] = useState(false) // 是否全屏显示全文
+  const [translationFile, setTranslationFile] = useState(null) // 翻译结果JSON文件名
   
   // 可调整大小的面板状态
   const [leftPanelWidth, setLeftPanelWidth] = useState(66.67) // 默认66.67%（2/3）
@@ -424,149 +425,196 @@ function App() {
     }
   }
 
-  // 处理翻译（分批翻译）
+  // 将翻译后的 Markdown 映射到 layout 中的文本块
+  const mapTranslationToBlocks = (translatedMarkdown, layoutBlocks) => {
+    if (!translatedMarkdown || !layoutBlocks || layoutBlocks.length === 0) {
+      return
+    }
+
+    try {
+      // 将翻译后的 Markdown 按段落分割（按双换行符或标题分割）
+      const translatedParagraphs = translatedMarkdown
+        .split(/\n\n+/)
+        .map(p => p.trim())
+        .filter(p => p.length > 0)
+
+      // 为每个 layout 块查找对应的翻译段落
+      const updatedLayout = layoutBlocks.map(block => {
+        if (!block.text || block.text.trim().length === 0) {
+          return block
+        }
+
+        const originalText = block.text.trim()
+        
+        // 方法1：尝试精确匹配（去除标点符号和空白后比较）
+        const normalizeText = (text) => {
+          return text
+            .toLowerCase()
+            .replace(/[^\w\s]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+        }
+
+        const normalizedOriginal = normalizeText(originalText)
+        
+        // 在翻译段落中查找最匹配的段落
+        let bestMatch = null
+        let bestScore = 0
+
+        for (const translatedPara of translatedParagraphs) {
+          const normalizedTranslated = normalizeText(translatedPara)
+          
+          // 计算相似度（简单的包含关系或长度相似度）
+          let score = 0
+          
+          // 如果翻译段落包含原文的关键词，给高分
+          const originalWords = normalizedOriginal.split(/\s+/).filter(w => w.length > 3)
+          const translatedWords = normalizedTranslated.split(/\s+/).filter(w => w.length > 3)
+          
+          const commonWords = originalWords.filter(w => translatedWords.includes(w))
+          if (commonWords.length > 0) {
+            score = commonWords.length / Math.max(originalWords.length, translatedWords.length)
+          }
+          
+          // 如果长度相似，也加分
+          const lengthRatio = Math.min(originalText.length, translatedPara.length) / 
+                              Math.max(originalText.length, translatedPara.length)
+          score += lengthRatio * 0.3
+          
+          if (score > bestScore) {
+            bestScore = score
+            bestMatch = translatedPara
+          }
+        }
+
+        // 如果找到匹配的翻译（相似度 > 0.3），则使用它
+        if (bestMatch && bestScore > 0.3) {
+          return {
+            ...block,
+            translated_text: bestMatch
+          }
+        }
+
+        // 如果没找到匹配，尝试基于位置匹配（按顺序）
+        const blockIndex = layoutBlocks.indexOf(block)
+        if (blockIndex >= 0 && blockIndex < translatedParagraphs.length) {
+          return {
+            ...block,
+            translated_text: translatedParagraphs[blockIndex]
+          }
+        }
+
+        return block
+      })
+
+      // 更新 layout state
+      setLayout(updatedLayout)
+      console.log(`已将翻译映射到 ${updatedLayout.filter(b => b.translated_text).length} 个文本块`)
+    } catch (err) {
+      console.error('映射翻译到文本块失败:', err)
+    }
+  }
+
+  // 处理翻译（流式翻译，实时显示进度）
   const handleTranslate = async () => {
-    if (!layout || layout.length === 0) {
-      setError('请先解析PDF文件')
+    if (!fullTextContent) {
+      setError('请先解析并加载全文内容')
+      return
+    }
+
+    const activeTaskId = taskId || batchId
+    if (!activeTaskId) {
+      setError('未找到任务ID，请先上传并解析PDF')
       return
     }
     
     try {
       setTranslating(true)
       setError(null)
+      setTranslatedFullText('') // 清空之前的翻译
+      setTranslationFile(null)
       
-      // 过滤出需要翻译的文本块
-      const blocksToTranslate = layout.filter(block => {
-        if (!block.text || !block.text.trim()) {
-          return false
-        }
-        // 如果强制重新翻译，则翻译所有文本块；否则只翻译没有翻译的
-        return forceRetranslate || !block.translated_text
-      })
-      
-      if (blocksToTranslate.length === 0) {
-        setError('没有需要翻译的文本块')
-        setTranslating(false)
-        return
-      }
-      
-      const BATCH_SIZE = 10 // 每批翻译10个文本块
-      const totalBlocks = blocksToTranslate.length
-      let translatedCount = 0
-      let skippedCount = 0
-      let failedCount = 0
-      let currentLayout = [...layout] // 当前layout的副本
-      
-      // 初始化进度
-      setTranslationProgress({ 
-        translated: 0, 
-        total: totalBlocks,
-        skipped: 0,
-        failed: 0
-      })
-      
-      // 分批翻译
-      for (let i = 0; i < blocksToTranslate.length; i += BATCH_SIZE) {
-        const batch = blocksToTranslate.slice(i, i + BATCH_SIZE)
-        const batchNumber = Math.floor(i / BATCH_SIZE) + 1
-        const totalBatches = Math.ceil(totalBlocks / BATCH_SIZE)
-        
-        console.log(`翻译第 ${batchNumber}/${totalBatches} 批，包含 ${batch.length} 个文本块`)
-        
-        try {
-          // 翻译当前批次
-          const result = await translateLayout(batch, 'zh', null, forceRetranslate)
-          
-          // 更新统计
-          translatedCount += result.translated_count || 0
-          skippedCount += result.skipped_count || 0
-          failedCount += result.failed_count || 0
-          
-          // 创建翻译映射
-          const translationMap = new Map()
-          result.layout.forEach(translatedBlock => {
-            const key = `${translatedBlock.page}_${translatedBlock.text}`
-            translationMap.set(key, translatedBlock.translated_text)
-          })
-          
-          // 更新当前layout中的翻译文本
-          currentLayout = currentLayout.map(block => {
-            if (forceRetranslate || !block.translated_text) {
-              const key = `${block.page}_${block.text}`
-              const translatedText = translationMap.get(key)
-              if (translatedText) {
-                return { ...block, translated_text: translatedText }
-              }
+      const translationTimestamp = Math.floor(Date.now() / 1000)
+      const translationId = `trans_${translationTimestamp}_${Math.random().toString(36).substr(2, 9)}`
+
+      // 用于累积翻译内容
+      const translatedChunks = []
+      let totalChunks = 0
+
+      // 使用流式翻译 API
+      await translateFullMarkdownStream(
+        activeTaskId,
+        'zh',
+        null,
+        translationId,
+        translationTimestamp,
+        // onProgress 回调
+        (eventType, chunkNumber, total, translatedChunk, status, error) => {
+          if (eventType === 'init') {
+            totalChunks = total || 0
+            setTranslationProgress({ translated: 0, total: total || 0, skipped: 0, failed: 0 })
+            if (totalChunks > 0) {
+              translatedChunks.length = totalChunks
             }
-            return block
-          })
+          } else if (eventType === 'progress') {
+            totalChunks = total || totalChunks
+            // 更新进度
+            setTranslationProgress(prev => ({
+              translated: Math.max(chunkNumber, prev?.translated || 0),
+              total: total || prev?.total || totalChunks,
+              skipped: prev?.skipped || 0,
+              failed: status === 'failed' ? (prev?.failed || 0) + 1 : (prev?.failed || 0)
+            }))
+
+            // 累积翻译内容
+            if (translatedChunk) {
+              translatedChunks[chunkNumber - 1] = translatedChunk
+              
+              // 实时更新显示（拼接已翻译的块）
+              const currentTranslated = translatedChunks
+                .filter(chunk => chunk !== undefined && chunk !== null)
+                .join('\n\n')
+              setTranslatedFullText(currentTranslated)
+            }
+
+            if (error) {
+              console.error(`翻译块 ${chunkNumber} 失败:`, error)
+            }
+          }
+        },
+        // onComplete 回调
+        (content, translationFile) => {
+          setTranslatedFullText(content)
+          setTranslationFile(translationFile)
           
-          // 立即更新UI，显示已翻译的文本块
-          setLayout([...currentLayout])
-          
-          // 更新进度
-          setTranslationProgress({ 
-            translated: translatedCount, 
-            total: totalBlocks,
-            skipped: skippedCount,
-            failed: failedCount
-          })
-          
-          // 如果有全文内容，每批完成后更新翻译全文
-          if (fullTextContent && currentLayout.length > 0) {
-            generateTranslatedFullText(fullTextContent, currentLayout)
+          // 将翻译后的 Markdown 映射到 layout 中的文本块
+          if (content && layout.length > 0) {
+            mapTranslationToBlocks(content, layout)
           }
           
-        } catch (err) {
-          console.error(`第 ${batchNumber} 批翻译失败:`, err)
-          failedCount += batch.length
-          setTranslationProgress({ 
-            translated: translatedCount, 
-            total: totalBlocks,
-            skipped: skippedCount,
-            failed: failedCount
+          setTranslationProgress(prev => {
+            const totalValue = prev?.total || totalChunks
+            return {
+              translated: totalValue,
+              total: totalValue,
+              skipped: prev?.skipped || 0,
+              failed: prev?.failed || 0
+            }
           })
-          // 继续翻译下一批，不中断
+          setError(null)
+          console.log('翻译完成！')
+        },
+        // onError 回调
+        (error) => {
+          const errorMsg = error.message || '未知错误'
+          setError(`翻译失败: ${errorMsg}`)
+          console.error('翻译错误详情:', error)
         }
-      }
-      
-      // 最终更新
-      setLayout([...currentLayout])
-      setTranslationProgress({ 
-        translated: translatedCount, 
-        total: totalBlocks,
-        skipped: skippedCount,
-        failed: failedCount
-      })
-      
-      // 如果有全文内容，最终更新翻译全文
-      if (fullTextContent && currentLayout.length > 0) {
-        generateTranslatedFullText(fullTextContent, currentLayout)
-      }
-      
-      // 显示翻译结果消息
-      const message = `翻译完成：成功 ${translatedCount} 个`
-      if (failedCount > 0) {
-        setError(`${message}，失败 ${failedCount} 个`)
-      } else if (skippedCount > 0) {
-        setError(`${message}，跳过 ${skippedCount} 个（已有翻译）`)
-      } else {
-        // 全部成功，清除错误消息
-        setError(null)
-      }
+      )
     } catch (err) {
       const errorMsg = err.message || '未知错误'
       setError(`翻译失败: ${errorMsg}`)
       console.error('翻译错误详情:', err)
-      
-      // 如果是API配置问题，提供更明确的提示
-      if (errorMsg.includes('API密钥') || errorMsg.includes('QWEN_API_KEY')) {
-        setError(`翻译失败: 请检查通义千问API密钥配置。错误: ${errorMsg}`)
-      } else if (errorMsg.includes('rate limit') || errorMsg.includes('429')) {
-        setError(`翻译失败: API调用频率超限，请稍后重试。错误: ${errorMsg}`)
-      } else if (errorMsg.includes('timeout')) {
-        setError(`翻译失败: API调用超时，请检查网络连接。错误: ${errorMsg}`)
-      }
     } finally {
       setTranslating(false)
     }
@@ -575,6 +623,38 @@ function App() {
   // 从MinerU数据中提取layout
   const extractLayoutFromMineruData = (mineruData) => {
     const extractedLayout = []
+    
+    const countersMap = new Map()
+    const getCounter = (pageNo) => {
+      if (!countersMap.has(pageNo)) {
+        countersMap.set(pageNo, { page: pageNo, index: 0 })
+      }
+      return countersMap.get(pageNo)
+    }
+    
+    const getBlockId = (block, counter) => {
+      if (!block) {
+        return `p${counter.page}_b${counter.index++}`
+      }
+      const rawId = block.block_id || block.id || block.uuid || block.index
+      if (rawId !== undefined && rawId !== null) {
+        return String(rawId)
+      }
+      return `p${counter.page}_b${counter.index++}`
+    }
+    
+    const pushBlock = (pageNo, bbox, text, type, block, extra = {}) => {
+      if (!text) return
+      const counter = getCounter(pageNo)
+      extractedLayout.push({
+        page: pageNo,
+        bbox: bbox,
+        text: text,
+        type: type,
+        block_id: getBlockId(block, counter),
+        ...extra
+      })
+    }
     
     try {
       if (!mineruData) {
@@ -601,7 +681,6 @@ function App() {
               return
             }
             
-            // 从lines -> spans -> content中提取文本
             const lines = block.lines || []
             const textParts = []
             
@@ -620,14 +699,7 @@ function App() {
             })
             
             const text = textParts.join(' ').trim()
-            if (text) {
-              extractedLayout.push({
-                page: pageNo,
-                bbox: bbox,
-                text: text,
-                type: blockType
-              })
-            }
+            pushBlock(pageNo, bbox, text, blockType, block)
           })
         })
         
@@ -655,12 +727,7 @@ function App() {
               blockType = 'title'
             }
             
-            extractedLayout.push({
-              page: pageNo,
-              bbox: bbox,
-              text: text,
-              type: blockType
-            })
+            pushBlock(pageNo, bbox, text, blockType, item)
           })
           
           console.log('提取的layout数量:', extractedLayout.length)
@@ -686,12 +753,7 @@ function App() {
               
               const blockType = block.type || 'text'
               
-              extractedLayout.push({
-                page: pageNo,
-                bbox: bbox,
-                text: content,
-                type: blockType
-              })
+              pushBlock(pageNo, bbox, content, blockType, block)
             })
           })
           
@@ -726,14 +788,8 @@ function App() {
             })
             
             const text = textParts.join(' ').trim()
-            if (text) {
-              extractedLayout.push({
-                page: pageNo,
-                bbox: block.bbox || block.bbox_coords || [0, 0, 0, 0],
-                text: text,
-                type: blockType
-              })
-            }
+            const bbox = block.bbox || block.bbox_coords || [0, 0, 0, 0]
+            pushBlock(pageNo, bbox, text, blockType, block)
           })
         })
         
@@ -1133,6 +1189,17 @@ function App() {
                   >
                     {translating ? '翻译中...' : '翻译全文'}
                   </button>
+                  {translationFile && !translating && (
+                    <a
+                      href={getTranslationDownloadUrl(translationFile)}
+                      download={translationFile}
+                      className="px-3 py-1 rounded text-sm bg-blue-500 hover:bg-blue-600 text-white flex items-center gap-1"
+                      title="下载翻译结果JSON文件"
+                    >
+                      <span>📥</span>
+                      <span>下载翻译结果</span>
+                    </a>
+                  )}
                   <button
                     onClick={() => setDisplayMode('original')}
                     className={`px-3 py-1 rounded text-sm ${

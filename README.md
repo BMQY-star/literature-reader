@@ -55,7 +55,12 @@ literature-reader/
 │   └── package.json
 │
 ├── requirements.txt       # Python依赖
-└── README.md
+├── README.md              # 项目说明
+└── docs/                  # 文档目录
+    ├── USER_GUIDE.md      # 完整使用指南
+    ├── API_CONFIG.md      # API配置指南
+    ├── TROUBLESHOOTING.md # 故障排除
+    └── CONTRIBUTING.md    # 贡献指南
 ```
 
 ## 🚀 快速开始
@@ -127,13 +132,20 @@ npm run dev
 
 ## 📖 使用指南
 
-详细使用说明请查看 **[USER_GUIDE.md](USER_GUIDE.md)**，包含：
+详细使用说明请查看 **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)**，包含：
 
 - ✅ 快速开始和安装指南
 - ✅ 环境配置和API设置
 - ✅ 功能使用说明（PDF解析、翻译、全文显示、双栏对照）
 - ✅ GitHub代码管理
 - ✅ 故障排除和常见问题
+
+### 📚 文档目录
+
+- **[完整使用指南](docs/USER_GUIDE.md)** - 包含所有使用说明和配置指南
+- **[API配置指南](docs/API_CONFIG.md)** - MinerU和通义千问API配置详情
+- **[故障排除](docs/TROUBLESHOOTING.md)** - 常见问题和解决方案
+- **[贡献指南](docs/CONTRIBUTING.md)** - 如何参与项目贡献
 
 ### 快速功能概览
 

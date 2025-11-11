@@ -14,16 +14,9 @@ logger = logging.getLogger(__name__)
 
 def get_cache():
     """
-    获取已初始化的缓存对象
-    
-    Returns:
-        Cache对象，如果未初始化则返回None
+    获取已初始化的缓存对象（目前禁用缓存，直接返回None）
     """
-    try:
-        return current_app.extensions.get('cache')
-    except (RuntimeError, AttributeError):
-        # 不在应用上下文中或缓存未初始化
-        return None
+    return None
 
 
 def get_translation_cache_key(text: str, target_lang: str) -> str:
@@ -56,17 +49,7 @@ def translate_with_llm(text: str, target_lang: str = "zh", model: str = None) ->
     if not text or not text.strip():
         return text
     
-    # 检查缓存
-    cache = get_cache()
-    if cache:
-        try:
-            cache_key = get_translation_cache_key(text, target_lang)
-            cached_result = cache.get(cache_key)
-            if cached_result:
-                logger.debug(f"使用缓存翻译: {cache_key[:8]}...")
-                return cached_result
-        except Exception as cache_error:
-            logger.warning(f"缓存读取失败: {cache_error}，继续调用API")
+    # 检查缓存（目前已禁用）
     
     # 获取配置 - 优先使用通义千问配置
     qwen_api_key = current_app.config.get('QWEN_API_KEY', '')
@@ -97,7 +80,7 @@ def translate_with_llm(text: str, target_lang: str = "zh", model: str = None) ->
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
         logger.info(f"OpenAI客户端已初始化，base_url: {base_url}, timeout: 60秒")
         
-        # 构建提示词
+        # 构建提示词（直接使用原始文本，在提示词中要求保留 LaTeX）
         lang_map = {
             'zh': '中文',
             'en': 'English',
@@ -106,25 +89,39 @@ def translate_with_llm(text: str, target_lang: str = "zh", model: str = None) ->
         }
         target_lang_name = lang_map.get(target_lang, target_lang)
         
-        prompt = (
-            f"请将以下学术段落翻译成{target_lang_name}，"
-            f"保持术语准确性和结构完整性，不要添加任何解释或注释：\n\n{text}"
-        )
+        prompt_lines = [
+            f"请将以下学术段落翻译成{target_lang_name}，保持术语准确性和结构完整性。",
+            "",
+            "【重要要求】：",
+            "1. 必须原样保留所有 LaTeX 数学公式，包括：",
+            "   - 行内公式：$...$ 格式（例如：$x = y + z$）",
+            "   - 显示公式：$$...$$ 格式（例如：$$\\sum_{i=1}^{n} x_i$$）",
+            "   - 公式内容不得翻译、修改或删除任何符号",
+            "2. 保留所有 Markdown 结构与排版（包括标题、列表、表格、粗体、斜体等），不要改动 Markdown 的语法符号",
+            "3. 保留代码块、行内代码等格式，勿删除 ` 或 ```",
+            "4. 【关键】只返回中文翻译，不要保留英文原文，不要出现中英文对照的形式",
+            "   - 如果原文是英文，翻译后只保留中文",
+            "   - 不要出现类似 '英文原文（中文翻译）' 或 '中文翻译（英文原文）' 的格式",
+            "   - 仅在必要时（如专业术语、人名、地名等），可以在中文后加括号标注英文，例如：'机器学习（Machine Learning）'",
+            "5. 不要添加额外解释、注释或前后文",
+            "",
+            "原文：",
+            text
+        ]
+        prompt = "\n".join(prompt_lines)
         
         # 检查文本长度（通义千问有token限制）
         if len(text) > 6000:  # 大约1500个token
             logger.warning(f"文本过长 ({len(text)} 字符)，可能超出token限制")
         
-        # 记录即将发送给大模型的内容
-        logger.info(f"准备调用大模型翻译，文本长度: {len(text)} 字符")
-        logger.debug(f"发送给大模型的文本内容: {text[:200]}..." if len(text) > 200 else f"发送给大模型的文本内容: {text}")
+        # 减少日志输出（提升性能）- 只对长文本或调试模式记录详细日志
+        if len(text) > 500:
+            logger.debug(f"调用翻译API: 文本长度={len(text)} 字符, model={default_model}")
         
         # 调用大模型API
         try:
             import time
             start_time = time.time()
-            logger.info(f"正在调用 {default_model} 模型进行翻译...")
-            logger.info(f"API请求开始时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
             
             response = client.chat.completions.create(
                 model=default_model,
@@ -133,7 +130,9 @@ def translate_with_llm(text: str, target_lang: str = "zh", model: str = None) ->
             )
             
             elapsed_time = time.time() - start_time
-            logger.info(f"大模型API调用成功，收到响应，耗时: {elapsed_time:.2f}秒")
+            # 只在慢请求时记录日志（>2秒）
+            if elapsed_time > 2.0:
+                logger.warning(f"慢请求: 翻译耗时 {elapsed_time:.2f}秒, 文本长度={len(text)}")
         except Exception as api_error:
             error_msg = str(api_error)
             logger.error(f"API调用失败: {error_msg}")
@@ -167,9 +166,9 @@ def translate_with_llm(text: str, target_lang: str = "zh", model: str = None) ->
         if translated_text == text:
             logger.warning(f"大模型返回的翻译结果与原文相同，可能未进行翻译")
         
-        # 记录翻译结果
-        logger.info(f"大模型翻译完成: 原文 {len(text)} 字符 -> 译文 {len(translated_text)} 字符")
-        logger.debug(f"翻译结果预览: {translated_text[:200]}..." if len(translated_text) > 200 else f"翻译结果: {translated_text}")
+        # 减少日志输出 - 只在调试模式或长文本时记录
+        if len(text) > 500:
+            logger.debug(f"翻译完成: {len(text)} -> {len(translated_text)} 字符")
         
         # 缓存结果
         cache = get_cache()

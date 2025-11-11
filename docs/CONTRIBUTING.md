@@ -85,7 +85,7 @@ docs: 更新API文档
 
 ## 开发环境设置
 
-参考[README.md](README.md)中的"快速开始"部分。
+参考[README.md](../README.md)中的"快速开始"部分。
 
 ## 测试
 
